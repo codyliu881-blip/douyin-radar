@@ -321,7 +321,7 @@ def cmd_collect(keyword):
     raw = fetch_comments(top["aweme_id"])
     filtered = [c for c in raw if is_quality_comment(c["text"])]
     filtered.sort(key=lambda c: c["digg_count"], reverse=True)
-    top10 = filtered[:10]
+    top20 = filtered[:20]
     print(f"拉到 {len(raw)} 条评论，过滤后剩 {len(filtered)} 条，取前 {len(top10)} 条")
 
     path = write_markdown(keyword, top, top10)
