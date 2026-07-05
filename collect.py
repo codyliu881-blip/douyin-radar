@@ -31,6 +31,11 @@ DEBUG = False  # --debug 开启后，打印每次请求的状态码和原始返�
 TOP_VIDEOS = 2  # 每个关键词输出几个视频（按点赞从高到低取）
 TOP_COMMENTS = 20  # 每个视频取几条高赞评论
 
+# 搜索相关
+SEARCH_PAGES = 3  # 搜索翻几页，扩大候选池（只看第 1 页会漏掉高赞视频）
+SEARCH_SORT_TYPE = "1"  # 排序：'0'综合 / '1'最多点赞 / '2'最新（以 TikHub 实际为准，可用 --debug 验证）
+SEARCH_PUBLISH_TIME = "0"  # 发布时间：'0'不限 / '1'一天 / '7'一周 / '180'半年内（想只看近期就改这里）
+
 load_dotenv()
 API_KEY = (os.getenv("TIKHUB_API_KEY") or "").strip()
 
@@ -107,6 +112,14 @@ def _find_container(obj, key):
     return None
 
 
+def fmt_date(ts):
+    """把 unix 秒时间戳转成 '2024-05-18'；缺失或异常返回 '未知'。"""
+    try:
+        return datetime.fromtimestamp(int(ts)).strftime("%Y-%m-%d")
+    except (TypeError, ValueError, OSError):
+        return "未知"
+
+
 def human(n):
     """把点赞数转成 '12.3万' 之类的可读形式；转换失败原样返回。"""
     try:
@@ -138,44 +151,64 @@ def fetch_hot_list(board_type=0):
 # --------------------------------------------------------------------------- #
 # 接口 2：视频搜索（POST）
 # --------------------------------------------------------------------------- #
-def search_videos(keyword):
+def search_videos(keyword, max_pages=SEARCH_PAGES):
     """POST /api/v1/douyin/search/fetch_video_search_v2
 
-    请求体：{"keyword": <词>, "cursor": 0, "sort_type": "0"}
+    请求体：{"keyword": <词>, "cursor": <页>, "sort_type": SEARCH_SORT_TYPE, ...}
     视频在 business_data[]，视频信息在 business_data[i].data.aweme_info。
-    广告/非视频卡片没有 aweme_info，跳过。
+    广告/非视频卡片没有 aweme_info，跳过。翻多页扩大候选池，跨页按 aweme_id 去重。
     """
-    body = {"keyword": keyword, "cursor": 0, "sort_type": "0"}
-    data = _request(
-        "POST",
-        "/api/v1/douyin/search/fetch_video_search_v2",
-        json=body,
-    )
-    if not data:
-        return []
-
-    # business_data 不管被套多深，递归找到那一层
-    container = _find_container(data, "business_data")
-    business_data = container["business_data"] if container else []
-
     videos = []
-    for elem in business_data:
-        aweme = _dig(elem, "data", "aweme_info")
-        if not isinstance(aweme, dict):
-            continue  # 广告 / 非视频卡片，没有 aweme_info
-        aweme_id = aweme.get("aweme_id")
-        if not aweme_id:
-            continue
-        stats = aweme.get("statistics") or {}
-        videos.append(
-            {
-                "aweme_id": aweme_id,
-                "desc": aweme.get("desc") or "",
-                "digg_count": stats.get("digg_count") or 0,
-                "comment_count": stats.get("comment_count") or 0,
-                "url": f"https://www.douyin.com/video/{aweme_id}",
-            }
+    seen = set()
+    cursor = 0
+    for _ in range(max_pages):
+        body = {
+            "keyword": keyword,
+            "cursor": cursor,
+            "sort_type": SEARCH_SORT_TYPE,
+            "publish_time": SEARCH_PUBLISH_TIME,
+        }
+        data = _request(
+            "POST",
+            "/api/v1/douyin/search/fetch_video_search_v2",
+            json=body,
         )
+        if not data:
+            break
+
+        # business_data 不管被套多深，递归找到那一层
+        container = _find_container(data, "business_data")
+        if not container:
+            break
+        business_data = container["business_data"]
+
+        for elem in business_data:
+            aweme = _dig(elem, "data", "aweme_info")
+            if not isinstance(aweme, dict):
+                continue  # 广告 / 非视频卡片，没有 aweme_info
+            aweme_id = aweme.get("aweme_id")
+            if not aweme_id or aweme_id in seen:
+                continue
+            seen.add(aweme_id)
+            stats = aweme.get("statistics") or {}
+            videos.append(
+                {
+                    "aweme_id": aweme_id,
+                    "desc": aweme.get("desc") or "",
+                    "digg_count": stats.get("digg_count") or 0,
+                    "comment_count": stats.get("comment_count") or 0,
+                    "create_time": aweme.get("create_time"),  # 发布时间，unix 秒
+                    "url": f"https://www.douyin.com/video/{aweme_id}",
+                }
+            )
+
+        # 翻页：cursor / has_more 通常和 business_data 同级
+        has_more = container.get("has_more")
+        next_cursor = container.get("cursor")
+        if not has_more or next_cursor is None or next_cursor == cursor:
+            break
+        cursor = next_cursor
+
     return videos
 
 
@@ -268,6 +301,7 @@ def write_markdown(keyword, sections):
             f"- 文案：{video['desc'] or '(无文案)'}",
             f"- 点赞：{human(video['digg_count'])}（{video['digg_count']}）",
             f"- 评论数：{human(video['comment_count'])}（{video['comment_count']}）",
+            f"- 发布时间：{fmt_date(video['create_time'])}",
             f"- 链接：{video['url']}",
             "",
             f"### 高赞评论 Top {len(comments)}",
@@ -327,7 +361,8 @@ def cmd_collect(keyword):
     sections = []
     for idx, video in enumerate(chosen, 1):
         desc_preview = video["desc"][:40] + ("…" if len(video["desc"]) > 40 else "")
-        print(f"[{idx}/{len(chosen)}] {desc_preview or '(无文案)'}  {video['url']}")
+        print(f"[{idx}/{len(chosen)}] 赞 {human(video['digg_count'])}  发布 {fmt_date(video['create_time'])}")
+        print(f"        {desc_preview or '(无文案)'}  {video['url']}")
         print("  正在拉取评论…")
         raw = fetch_comments(video["aweme_id"])
         filtered = [c for c in raw if is_quality_comment(c["text"])]
