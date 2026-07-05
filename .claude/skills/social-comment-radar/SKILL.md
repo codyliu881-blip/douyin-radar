@@ -147,10 +147,43 @@ def fetch_hot_list():
 ## 落地步骤（给新平台时照做）
 
 1. 找到该平台在数据 API 里的三个接口，**核对文档**里的路径、方法、字段名。
-2. `cp` 一份 douyin-radar，改 `BASE_URL`、`API_KEY` 变量名、三个 `fetch_*` 的路径和字段。
+2. `cp` 一份 douyin-radar，只改**三个 `fetch_*` 的路径和字段名**（见下方速查表）。
+   - **同一个数据 API（如一直用 TikHub）时，`BASE_URL` 和 `API_KEY` 都不用动**：
+     所有平台都挂在 `api.tikhub.io` 下，区别只在路径里的平台名
+     （`/api/v1/douyin/...` → `/api/v1/xiaohongshu/...`），同一个 key 通吃。
+   - 只有**换掉整个 API 聚合商**时，才改 `BASE_URL` 和 key 变量名。
 3. 先跑 `--hotlist --debug`，看 `原始返回` 确认字段真实位置，调 `_find_container` 的 key。
 4. 跑 `python collect.py "关键词" --debug` 跑通完整链路。
 5. 打开 `output/` 里的 md 检查内容。
+
+## 换平台时字段名改在哪（速查）
+
+字段名不散落，就集中在每个 `fetch_*` 函数的 `_find_container(...)` 那行和紧跟的 `.get("...")` 里。
+对着这些位置，把引号里的名字换成新平台 `--debug` 返回里的真实字段名即可，函数结构不用动。
+
+| 要改的东西 | 在哪 | 抖音的值（示例） |
+| --- | --- | --- |
+| 热词列表名 | `fetch_hot_list` 里的 `_find_container(data, "…")` | `word_list` |
+| 热词各字段 | `cmd_hotlist` 里的 `item.get("…")` | `word` / `hot_value` / `video_count` |
+| 搜索结果数组名 | `search_videos` 里的 `_find_container(data, "…")` | `business_data` |
+| 内容主体嵌套路径 | `search_videos` 里的 `_dig(elem, …)` | `data` → `aweme_info` |
+| 内容各字段 | `search_videos` 里的 `.get("…")` | `aweme_id` / `desc` / `statistics.digg_count` / `comment_count` |
+| 评论列表名 | `fetch_comments` 里的 `_find_container(data, "…")` | `comments` |
+| 评论各字段 | `fetch_comments` 里的 `.get("…")` | `text` / `digg_count` / `ip_label` |
+| 翻页控制 | `fetch_comments` 里的 `container.get("…")` | `has_more` / `cursor` |
+
+> 提示：非抖音平台字段名多半不同（点赞不一定叫 `digg_count`、内容主体不叫 `aweme_info`），
+> 一律以 `--debug` 打印的原始返回为准。
+
+## 调输出数量 / 拉取范围
+
+| 想改什么 | 改哪 |
+| --- | --- |
+| 取前 N 条评论（默认 10） | `cmd_collect` 里 `filtered[:10]` 的数字 |
+| 备选评论池大小（默认最多 3 页×20=60 条） | `fetch_comments(..., max_pages=3, count=20)` 的 `max_pages` |
+| 评论质量门槛（默认剔除 <8 字/纯表情/纯标点） | `is_quality_comment` 里的长度阈值和正则 |
+
+> 注意：取前 N 依赖备选池够大。想稳定拿到 20 条高赞，`filtered[:20]` 的同时可把 `max_pages` 调大些。
 
 ## 排查：加 `--debug` 开关
 
