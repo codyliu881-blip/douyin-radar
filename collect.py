@@ -26,6 +26,7 @@ from dotenv import load_dotenv
 
 BASE_URL = "https://api.tikhub.io"
 RATE_LIMIT_SLEEP = 0.2  # 秒；每次请求之间的间隔，避免触发 10/second 限速
+DEBUG = False  # --debug 开启后，打印每次请求的状态码和原始返回
 
 load_dotenv()
 API_KEY = (os.getenv("TIKHUB_API_KEY") or "").strip()
@@ -41,6 +42,12 @@ def _request(method, path, **kwargs):
     """
     url = BASE_URL + path
     headers = {"Authorization": f"Bearer {API_KEY}", "Accept": "application/json"}
+    if DEBUG:
+        print(f"  [debug] {method} {url}", file=sys.stderr)
+        if kwargs.get("params"):
+            print(f"  [debug] params: {kwargs['params']}", file=sys.stderr)
+        if kwargs.get("json"):
+            print(f"  [debug] body:   {kwargs['json']}", file=sys.stderr)
     try:
         resp = requests.request(method, url, headers=headers, timeout=30, **kwargs)
     except requests.RequestException as exc:
@@ -49,6 +56,10 @@ def _request(method, path, **kwargs):
     finally:
         # 无论成功失败都限速，保证请求节奏
         time.sleep(RATE_LIMIT_SLEEP)
+
+    if DEBUG:
+        print(f"  [debug] HTTP {resp.status_code}", file=sys.stderr)
+        print(f"  [debug] 原始返回(前 1500 字)：{(resp.text or '')[:1500]}", file=sys.stderr)
 
     if resp.status_code != 200:
         snippet = (resp.text or "")[:200]
@@ -307,7 +318,13 @@ def main():
     parser.add_argument(
         "--hotlist", action="store_true", help="只调热榜接口，打印热词供肉眼挑选"
     )
+    parser.add_argument(
+        "--debug", action="store_true", help="打印每次请求的状态码和原始返回，便于排查"
+    )
     args = parser.parse_args()
+
+    global DEBUG
+    DEBUG = args.debug
 
     if not args.hotlist and not args.keyword:
         parser.print_help()
