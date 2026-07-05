@@ -125,6 +125,48 @@ def fmt_date(ts):
         return "未知"
 
 
+def _find_scalar(obj, key):
+    """深度优先找第一个 key 对应的标量值（非 dict/list）；找不到返回 None。"""
+    if isinstance(obj, dict):
+        if key in obj and not isinstance(obj[key], (dict, list)):
+            return obj[key]
+        for value in obj.values():
+            found = _find_scalar(value, key)
+            if found is not None:
+                return found
+    elif isinstance(obj, list):
+        for item in obj:
+            found = _find_scalar(item, key)
+            if found is not None:
+                return found
+    return None
+
+
+def _next_cursor(data, container, cursor_key, current, page_len):
+    """稳健地算下一页游标。返回 (下一个游标, 是否继续)。
+
+    TikHub 的 has_more / cursor 不一定和列表同级，先就近取、再全局深搜；
+    实在取不到有效游标就按偏移(page_len)前进——抖音的 cursor/max_cursor 基本是偏移量。
+    这样避免「取不到游标 → 只翻一页」的坑。
+    """
+    has_more = container.get("has_more")
+    if has_more is None:
+        has_more = _find_scalar(data, "has_more")
+    if has_more == 0 or has_more is False:
+        return current, False
+
+    nxt = container.get(cursor_key)
+    if nxt is None:
+        nxt = _find_scalar(data, cursor_key)
+    if nxt is not None and nxt != current:
+        return nxt, True
+
+    # 没拿到有效游标：按偏移前进（配合上层「本页无新增就停」的保护，安全）
+    if page_len > 0:
+        return current + page_len, True
+    return current, False
+
+
 def human(n):
     """把点赞数转成 '12.3万' 之类的可读形式；转换失败原样返回。"""
     try:
@@ -210,6 +252,7 @@ def search_videos(keyword, max_pages=SEARCH_PAGES):
             break
         business_data = container["business_data"]
 
+        added = 0
         for elem in business_data:
             aweme = _dig(elem, "data", "aweme_info")  # 搜索结果里视频套在 data.aweme_info
             video = _video_from_aweme(aweme)
@@ -217,13 +260,13 @@ def search_videos(keyword, max_pages=SEARCH_PAGES):
                 continue  # 广告/非视频卡片，或重复
             seen.add(video["aweme_id"])
             videos.append(video)
+            added += 1
 
-        # 翻页：cursor / has_more 通常和 business_data 同级
-        has_more = container.get("has_more")
-        next_cursor = container.get("cursor")
-        if not has_more or next_cursor is None or next_cursor == cursor:
+        if added == 0:
             break
-        cursor = next_cursor
+        cursor, cont = _next_cursor(data, container, "cursor", cursor, len(business_data))
+        if not cont:
+            break
 
     return videos
 
@@ -262,18 +305,21 @@ def fetch_user_videos(sec_user_id, max_pages=USER_PAGES, count=20):
         if not container:
             break
 
-        for aweme in container["aweme_list"]:
+        aweme_list = container["aweme_list"]
+        added = 0
+        for aweme in aweme_list:
             video = _video_from_aweme(aweme)
             if not video or video["aweme_id"] in seen:
                 continue
             seen.add(video["aweme_id"])
             videos.append(video)
+            added += 1
 
-        has_more = container.get("has_more")
-        next_cursor = container.get("max_cursor")
-        if not has_more or next_cursor is None or next_cursor == max_cursor:
+        if added == 0:
             break
-        max_cursor = next_cursor
+        max_cursor, cont = _next_cursor(data, container, "max_cursor", max_cursor, len(aweme_list))
+        if not cont:
+            break
 
     return videos
 
@@ -299,12 +345,15 @@ def fetch_comments(aweme_id, max_pages=COMMENT_PAGES, count=20):
         if not data:
             break
 
-        # comments 不管被套多深，递归找到含它的那个 dict（好顺带拿 has_more/cursor）
+        # comments 不管被套多深，递归找到含它的那个 dict
         container = _find_container(data, "comments")
         if not container:
             break
         comments = container["comments"]
+        if not comments:
+            break
 
+        added = 0
         for c in comments:
             if not isinstance(c, dict):
                 continue
@@ -313,6 +362,7 @@ def fetch_comments(aweme_id, max_pages=COMMENT_PAGES, count=20):
             if key in seen:
                 continue
             seen.add(key)
+            added += 1
             collected.append(
                 {
                     "text": text,
@@ -321,11 +371,11 @@ def fetch_comments(aweme_id, max_pages=COMMENT_PAGES, count=20):
                 }
             )
 
-        has_more = container.get("has_more")
-        next_cursor = container.get("cursor")
-        if not has_more or next_cursor is None or next_cursor == cursor:
+        if added == 0:  # 本页没有新评论，说明翻不动了，停
             break
-        cursor = next_cursor
+        cursor, cont = _next_cursor(data, container, "cursor", cursor, len(comments))
+        if not cont:
+            break
 
     return collected
 
