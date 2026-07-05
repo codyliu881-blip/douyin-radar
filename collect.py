@@ -26,6 +26,7 @@ from dotenv import load_dotenv
 
 BASE_URL = "https://api.tikhub.io"
 RATE_LIMIT_SLEEP = 0.2  # 秒；每次请求之间的间隔，避免触发 10/second 限速
+DEBUG = False  # --debug 开启后，打印每次请求的状态码和原始返回
 
 load_dotenv()
 API_KEY = (os.getenv("TIKHUB_API_KEY") or "").strip()
@@ -41,6 +42,12 @@ def _request(method, path, **kwargs):
     """
     url = BASE_URL + path
     headers = {"Authorization": f"Bearer {API_KEY}", "Accept": "application/json"}
+    if DEBUG:
+        print(f"  [debug] {method} {url}", file=sys.stderr)
+        if kwargs.get("params"):
+            print(f"  [debug] params: {kwargs['params']}", file=sys.stderr)
+        if kwargs.get("json"):
+            print(f"  [debug] body:   {kwargs['json']}", file=sys.stderr)
     try:
         resp = requests.request(method, url, headers=headers, timeout=30, **kwargs)
     except requests.RequestException as exc:
@@ -49,6 +56,10 @@ def _request(method, path, **kwargs):
     finally:
         # 无论成功失败都限速，保证请求节奏
         time.sleep(RATE_LIMIT_SLEEP)
+
+    if DEBUG:
+        print(f"  [debug] HTTP {resp.status_code}", file=sys.stderr)
+        print(f"  [debug] 原始返回(前 1500 字)：{(resp.text or '')[:1500]}", file=sys.stderr)
 
     if resp.status_code != 200:
         snippet = (resp.text or "")[:200]
@@ -70,6 +81,27 @@ def _dig(obj, *keys):
             return None
         cur = cur.get(key)
     return cur
+
+
+def _find_container(obj, key):
+    """深度优先在嵌套 dict/list 里找到第一个「含有 key 且 key 对应 list」的 dict。
+
+    TikHub 的返回经常把真正的数据多套几层（data.data.xxx 之类），
+    用递归查找就不必写死具体路径，接口小改动也不容易崩。找不到返回 None。
+    """
+    if isinstance(obj, dict):
+        if isinstance(obj.get(key), list):
+            return obj
+        for value in obj.values():
+            found = _find_container(value, key)
+            if found is not None:
+                return found
+    elif isinstance(obj, list):
+        for item in obj:
+            found = _find_container(item, key)
+            if found is not None:
+                return found
+    return None
 
 
 def human(n):
@@ -96,8 +128,8 @@ def fetch_hot_list(board_type=0):
         "/api/v1/douyin/app/v3/fetch_hot_search_list",
         params={"board_type": board_type},
     )
-    word_list = _dig(data, "data", "word_list")
-    return word_list if isinstance(word_list, list) else []
+    container = _find_container(data, "word_list")
+    return container["word_list"] if container else []
 
 
 # --------------------------------------------------------------------------- #
@@ -119,12 +151,9 @@ def search_videos(keyword):
     if not data:
         return []
 
-    # business_data 可能在顶层，也可能在 data.business_data 下，两种都兜住
-    business_data = data.get("business_data")
-    if business_data is None:
-        business_data = _dig(data, "data", "business_data")
-    if not isinstance(business_data, list):
-        return []
+    # business_data 不管被套多深，递归找到那一层
+    container = _find_container(data, "business_data")
+    business_data = container["business_data"] if container else []
 
     videos = []
     for elem in business_data:
@@ -167,11 +196,11 @@ def fetch_comments(aweme_id, max_pages=3, count=20):
         if not data:
             break
 
-        # comments 可能在顶层，也可能在 data 下
-        payload = data.get("data") if isinstance(data.get("data"), dict) else data
-        comments = payload.get("comments")
-        if not isinstance(comments, list):
+        # comments 不管被套多深，递归找到含它的那个 dict（好顺带拿 has_more/cursor）
+        container = _find_container(data, "comments")
+        if not container:
             break
+        comments = container["comments"]
 
         for c in comments:
             if not isinstance(c, dict):
@@ -184,8 +213,8 @@ def fetch_comments(aweme_id, max_pages=3, count=20):
                 }
             )
 
-        has_more = payload.get("has_more")
-        next_cursor = payload.get("cursor")
+        has_more = container.get("has_more")
+        next_cursor = container.get("cursor")
         if not has_more or next_cursor is None or next_cursor == cursor:
             break
         cursor = next_cursor
@@ -307,7 +336,13 @@ def main():
     parser.add_argument(
         "--hotlist", action="store_true", help="只调热榜接口，打印热词供肉眼挑选"
     )
+    parser.add_argument(
+        "--debug", action="store_true", help="打印每次请求的状态码和原始返回，便于排查"
+    )
     args = parser.parse_args()
+
+    global DEBUG
+    DEBUG = args.debug
 
     if not args.hotlist and not args.keyword:
         parser.print_help()
