@@ -83,6 +83,27 @@ def _dig(obj, *keys):
     return cur
 
 
+def _find_container(obj, key):
+    """深度优先在嵌套 dict/list 里找到第一个「含有 key 且 key 对应 list」的 dict。
+
+    TikHub 的返回经常把真正的数据多套几层（data.data.xxx 之类），
+    用递归查找就不必写死具体路径，接口小改动也不容易崩。找不到返回 None。
+    """
+    if isinstance(obj, dict):
+        if isinstance(obj.get(key), list):
+            return obj
+        for value in obj.values():
+            found = _find_container(value, key)
+            if found is not None:
+                return found
+    elif isinstance(obj, list):
+        for item in obj:
+            found = _find_container(item, key)
+            if found is not None:
+                return found
+    return None
+
+
 def human(n):
     """把点赞数转成 '12.3万' 之类的可读形式；转换失败原样返回。"""
     try:
@@ -107,8 +128,8 @@ def fetch_hot_list(board_type=0):
         "/api/v1/douyin/app/v3/fetch_hot_search_list",
         params={"board_type": board_type},
     )
-    word_list = _dig(data, "data", "word_list")
-    return word_list if isinstance(word_list, list) else []
+    container = _find_container(data, "word_list")
+    return container["word_list"] if container else []
 
 
 # --------------------------------------------------------------------------- #
@@ -130,12 +151,9 @@ def search_videos(keyword):
     if not data:
         return []
 
-    # business_data 可能在顶层，也可能在 data.business_data 下，两种都兜住
-    business_data = data.get("business_data")
-    if business_data is None:
-        business_data = _dig(data, "data", "business_data")
-    if not isinstance(business_data, list):
-        return []
+    # business_data 不管被套多深，递归找到那一层
+    container = _find_container(data, "business_data")
+    business_data = container["business_data"] if container else []
 
     videos = []
     for elem in business_data:
@@ -178,11 +196,11 @@ def fetch_comments(aweme_id, max_pages=3, count=20):
         if not data:
             break
 
-        # comments 可能在顶层，也可能在 data 下
-        payload = data.get("data") if isinstance(data.get("data"), dict) else data
-        comments = payload.get("comments")
-        if not isinstance(comments, list):
+        # comments 不管被套多深，递归找到含它的那个 dict（好顺带拿 has_more/cursor）
+        container = _find_container(data, "comments")
+        if not container:
             break
+        comments = container["comments"]
 
         for c in comments:
             if not isinstance(c, dict):
@@ -195,8 +213,8 @@ def fetch_comments(aweme_id, max_pages=3, count=20):
                 }
             )
 
-        has_more = payload.get("has_more")
-        next_cursor = payload.get("cursor")
+        has_more = container.get("has_more")
+        next_cursor = container.get("cursor")
         if not has_more or next_cursor is None or next_cursor == cursor:
             break
         cursor = next_cursor
