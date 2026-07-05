@@ -1,0 +1,13 @@
+# 环境变量（含 API Key），不要提交
+.env
+
+# 生成的采集结果
+output/*
+!output/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
