@@ -354,9 +354,11 @@ def fetch_comments(aweme_id, max_pages=COMMENT_PAGES, count=20):
             break
 
         added = 0
+        page_max = 0
         for c in comments:
             if not isinstance(c, dict):
                 continue
+            page_max = max(page_max, c.get("digg_count") or 0)
             text = c.get("text") or ""
             key = c.get("cid") or c.get("comment_id") or text  # 优先用评论唯一 id 去重
             if key in seen:
@@ -371,10 +373,22 @@ def fetch_comments(aweme_id, max_pages=COMMENT_PAGES, count=20):
                 }
             )
 
-        if added == 0:  # 本页没有新评论，说明翻不动了，停
+        if DEBUG:
+            print(
+                f"  [debug] 评论页 cursor={cursor} 返回{len(comments)}条 新增{added}条 本页最高赞={page_max}",
+                file=sys.stderr,
+            )
+
+        has_more = container.get("has_more")
+        if has_more is None:
+            has_more = _find_scalar(data, "has_more")
+
+        if added == 0:  # 本页没有新评论，翻不动了，停
             break
-        cursor, cont = _next_cursor(data, container, "cursor", cursor, len(comments))
-        if not cont:
+        cursor += count  # 抖音评论 cursor 是偏移量，纯偏移前进最稳
+        if has_more == 0 or has_more is False:
+            break
+        if has_more is None and len(comments) < count:
             break
 
     return collected
