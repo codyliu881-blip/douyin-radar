@@ -28,6 +28,9 @@ BASE_URL = "https://api.tikhub.io"
 RATE_LIMIT_SLEEP = 0.2  # 秒；每次请求之间的间隔，避免触发 10/second 限速
 DEBUG = False  # --debug 开启后，打印每次请求的状态码和原始返回
 
+TOP_VIDEOS = 2  # 每个关键词输出几个视频（按点赞从高到低取）
+TOP_COMMENTS = 20  # 每个视频取几条高赞评论
+
 load_dotenv()
 API_KEY = (os.getenv("TIKHUB_API_KEY") or "").strip()
 
@@ -242,7 +245,8 @@ def is_quality_comment(text):
 # --------------------------------------------------------------------------- #
 # 输出 markdown
 # --------------------------------------------------------------------------- #
-def write_markdown(keyword, video, comments):
+def write_markdown(keyword, sections):
+    """sections: [(video, comments), ...]，按点赞从高到低的多个视频，各自带高赞评论。"""
     os.makedirs("output", exist_ok=True)
     date = datetime.now().strftime("%Y%m%d")
     safe = re.sub(r"[^\w一-鿿-]", "_", keyword).strip("_")[:30] or "keyword"
@@ -253,26 +257,31 @@ def write_markdown(keyword, video, comments):
         "",
         f"- 采集时间：{datetime.now().strftime('%Y-%m-%d %H:%M')}",
         f"- 关键词：{keyword}",
-        "",
-        "## 选中视频（点赞最高）",
-        "",
-        f"- 文案：{video['desc'] or '(无文案)'}",
-        f"- 点赞：{human(video['digg_count'])}（{video['digg_count']}）",
-        f"- 评论数：{human(video['comment_count'])}（{video['comment_count']}）",
-        f"- 链接：{video['url']}",
-        "",
-        f"## 高赞评论 Top {len(comments)}",
+        f"- 视频数：{len(sections)}",
         "",
     ]
 
-    if not comments:
-        lines.append("_（没有符合条件的评论）_")
-    else:
-        for i, c in enumerate(comments, 1):
-            ip = c["ip_label"] or "未知"
-            lines.append(f"{i}. {c['text']}")
-            lines.append(f"   - 👍 {human(c['digg_count'])}（{c['digg_count']}）　📍 {ip}")
+    for idx, (video, comments) in enumerate(sections, 1):
+        lines += [
+            f"## 视频 {idx}（点赞 {human(video['digg_count'])}）",
+            "",
+            f"- 文案：{video['desc'] or '(无文案)'}",
+            f"- 点赞：{human(video['digg_count'])}（{video['digg_count']}）",
+            f"- 评论数：{human(video['comment_count'])}（{video['comment_count']}）",
+            f"- 链接：{video['url']}",
+            "",
+            f"### 高赞评论 Top {len(comments)}",
+            "",
+        ]
+        if not comments:
+            lines.append("_（没有符合条件的评论）_")
             lines.append("")
+        else:
+            for i, c in enumerate(comments, 1):
+                ip = c["ip_label"] or "未知"
+                lines.append(f"{i}. {c['text']}")
+                lines.append(f"   - 👍 {human(c['digg_count'])}（{c['digg_count']}）　📍 {ip}")
+                lines.append("")
 
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines).rstrip() + "\n")
@@ -310,21 +319,24 @@ def cmd_collect(keyword):
         print("没有搜到有效视频，退出。")
         return
 
-    # 接口默认不是按点赞排序的，自己按 digg_count 从高到低排，取最高的那条
+    # 接口默认不是按点赞排序的，自己按 digg_count 从高到低排，取前 TOP_VIDEOS 条
     videos.sort(key=lambda v: v["digg_count"], reverse=True)
-    top = videos[0]
-    print(f"找到 {len(videos)} 条视频，最高赞 {human(top['digg_count'])}")
-    desc_preview = top["desc"][:40] + ("…" if len(top["desc"]) > 40 else "")
-    print(f"选中视频：{desc_preview or '(无文案)'}  {top['url']}")
+    chosen = videos[:TOP_VIDEOS]
+    print(f"找到 {len(videos)} 条视频，取点赞最高的 {len(chosen)} 条（最高赞 {human(chosen[0]['digg_count'])}）")
 
-    print("正在拉取评论…")
-    raw = fetch_comments(top["aweme_id"])
-    filtered = [c for c in raw if is_quality_comment(c["text"])]
-    filtered.sort(key=lambda c: c["digg_count"], reverse=True)
-    top20 = filtered[:20]
-    print(f"拉到 {len(raw)} 条评论，过滤后剩 {len(filtered)} 条，取前 {len(top10)} 条")
+    sections = []
+    for idx, video in enumerate(chosen, 1):
+        desc_preview = video["desc"][:40] + ("…" if len(video["desc"]) > 40 else "")
+        print(f"[{idx}/{len(chosen)}] {desc_preview or '(无文案)'}  {video['url']}")
+        print("  正在拉取评论…")
+        raw = fetch_comments(video["aweme_id"])
+        filtered = [c for c in raw if is_quality_comment(c["text"])]
+        filtered.sort(key=lambda c: c["digg_count"], reverse=True)
+        top = filtered[:TOP_COMMENTS]
+        print(f"  拉到 {len(raw)} 条评论，过滤后剩 {len(filtered)} 条，取前 {len(top)} 条")
+        sections.append((video, top))
 
-    path = write_markdown(keyword, top, top10)
+    path = write_markdown(keyword, sections)
     print(f"✅ 已写入 {path}")
 
 
