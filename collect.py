@@ -37,6 +37,9 @@ SEARCH_SORT_TYPE = "1"  # 排序：'0'综合 / '1'最多点赞 / '2'最新发布
 SEARCH_PUBLISH_TIME = "180"  # 服务端发布时间过滤：'0'不限 / '1'一天 / '7'一周 / '180'半年内
 RECENT_DAYS = 0  # 客户端兜底过滤：只保留最近 N 天发布的视频，0=关闭（比服务端过滤更可靠）
 
+# 按博主采集相关
+USER_PAGES = 5  # 拉博主作品翻几页（越大越能覆盖到历史高赞老视频）
+
 load_dotenv()
 API_KEY = (os.getenv("TIKHUB_API_KEY") or "").strip()
 
@@ -132,6 +135,29 @@ def human(n):
     return str(n)
 
 
+def _video_from_aweme(aweme):
+    """从一个 aweme(视频)对象抽出我们要的字段；不是有效视频返回 None。
+
+    搜索和「博主作品列表」两个接口的视频对象结构一致，共用这个函数。
+    """
+    if not isinstance(aweme, dict):
+        return None
+    aweme_id = aweme.get("aweme_id")
+    if not aweme_id:
+        return None
+    stats = aweme.get("statistics") or {}
+    author = aweme.get("author") or {}
+    return {
+        "aweme_id": aweme_id,
+        "desc": aweme.get("desc") or "",
+        "digg_count": stats.get("digg_count") or 0,
+        "comment_count": stats.get("comment_count") or 0,
+        "create_time": aweme.get("create_time"),  # 发布时间，unix 秒
+        "author": author.get("nickname") or "",
+        "url": f"https://www.douyin.com/video/{aweme_id}",
+    }
+
+
 # --------------------------------------------------------------------------- #
 # 接口 1：热榜
 # --------------------------------------------------------------------------- #
@@ -184,24 +210,12 @@ def search_videos(keyword, max_pages=SEARCH_PAGES):
         business_data = container["business_data"]
 
         for elem in business_data:
-            aweme = _dig(elem, "data", "aweme_info")
-            if not isinstance(aweme, dict):
-                continue  # 广告 / 非视频卡片，没有 aweme_info
-            aweme_id = aweme.get("aweme_id")
-            if not aweme_id or aweme_id in seen:
-                continue
-            seen.add(aweme_id)
-            stats = aweme.get("statistics") or {}
-            videos.append(
-                {
-                    "aweme_id": aweme_id,
-                    "desc": aweme.get("desc") or "",
-                    "digg_count": stats.get("digg_count") or 0,
-                    "comment_count": stats.get("comment_count") or 0,
-                    "create_time": aweme.get("create_time"),  # 发布时间，unix 秒
-                    "url": f"https://www.douyin.com/video/{aweme_id}",
-                }
-            )
+            aweme = _dig(elem, "data", "aweme_info")  # 搜索结果里视频套在 data.aweme_info
+            video = _video_from_aweme(aweme)
+            if not video or video["aweme_id"] in seen:
+                continue  # 广告/非视频卡片，或重复
+            seen.add(video["aweme_id"])
+            videos.append(video)
 
         # 翻页：cursor / has_more 通常和 business_data 同级
         has_more = container.get("has_more")
@@ -209,6 +223,56 @@ def search_videos(keyword, max_pages=SEARCH_PAGES):
         if not has_more or next_cursor is None or next_cursor == cursor:
             break
         cursor = next_cursor
+
+    return videos
+
+
+# --------------------------------------------------------------------------- #
+# 接口 4：博主作品列表（按博主采集用）
+# --------------------------------------------------------------------------- #
+def extract_sec_user_id(target):
+    """从主页链接里抽 sec_user_id；已经是 sec_user_id 就原样返回。"""
+    target = (target or "").strip()
+    m = re.search(r"/user/([A-Za-z0-9_\-]+)", target)
+    if m:
+        return m.group(1)
+    return target  # 用户直接传了 sec_user_id
+
+
+def fetch_user_videos(sec_user_id, max_pages=USER_PAGES, count=20):
+    """GET /api/v1/douyin/app/v3/fetch_user_post_videos
+
+    参数 sec_user_id, max_cursor, count。作品在 aweme_list[]，结构同搜索的视频对象。
+    翻页看 max_cursor / has_more。
+    """
+    videos = []
+    seen = set()
+    max_cursor = 0
+    for _ in range(max_pages):
+        data = _request(
+            "GET",
+            "/api/v1/douyin/app/v3/fetch_user_post_videos",
+            params={"sec_user_id": sec_user_id, "max_cursor": max_cursor, "count": count},
+        )
+        if not data:
+            break
+
+        container = _find_container(data, "aweme_list")
+        if not container:
+            break
+
+        for aweme in container["aweme_list"]:
+            video = _video_from_aweme(aweme)
+            if not video or video["aweme_id"] in seen:
+                continue
+            seen.add(video["aweme_id"])
+            videos.append(video)
+
+        has_more = container.get("has_more")
+        next_cursor = container.get("max_cursor")
+        if not has_more or next_cursor is None or next_cursor == max_cursor:
+            break
+        max_cursor = next_cursor
 
     return videos
 
@@ -353,29 +417,18 @@ def cmd_hotlist():
         print("   ".join(parts))
 
 
-def cmd_collect(keyword):
-    print(f"正在搜索「{keyword}」…")
-    videos = search_videos(keyword)
-    if not videos:
-        print("没有搜到有效视频，退出。")
-        return
-    print(f"找到 {len(videos)} 条视频")
+def _apply_recent_filter(videos):
+    """按 RECENT_DAYS 只保留近期视频；关闭或过滤后为空时的处理都在这里。返回过滤后的列表。"""
+    if RECENT_DAYS <= 0:
+        return videos
+    cutoff = time.time() - RECENT_DAYS * 86400
+    recent = [v for v in videos if (v.get("create_time") or 0) >= cutoff]
+    print(f"按最近 {RECENT_DAYS} 天过滤：{len(videos)} → {len(recent)} 条")
+    return recent
 
-    # 客户端兜底：只保留最近 RECENT_DAYS 天发布的（比服务端 publish_time 更可靠）
-    if RECENT_DAYS > 0:
-        cutoff = time.time() - RECENT_DAYS * 86400
-        recent = [v for v in videos if (v.get("create_time") or 0) >= cutoff]
-        print(f"按最近 {RECENT_DAYS} 天过滤：{len(videos)} → {len(recent)} 条")
-        if not recent:
-            print("过滤后没有近期视频。可调大 RECENT_DAYS，或把 SEARCH_SORT_TYPE 改成 '0'(综合)/'2'(最新)。")
-            return
-        videos = recent
 
-    # 自己按 digg_count 从高到低排，取前 TOP_VIDEOS 条
-    videos.sort(key=lambda v: v["digg_count"], reverse=True)
-    chosen = videos[:TOP_VIDEOS]
-    print(f"取点赞最高的 {len(chosen)} 条（最高赞 {human(chosen[0]['digg_count'])}）")
-
+def _build_sections(chosen):
+    """对选中的每个视频拉评论、过滤、排序取前 TOP_COMMENTS，返回 [(video, comments), ...]。"""
     sections = []
     for idx, video in enumerate(chosen, 1):
         desc_preview = video["desc"][:40] + ("…" if len(video["desc"]) > 40 else "")
@@ -388,18 +441,56 @@ def cmd_collect(keyword):
         top = filtered[:TOP_COMMENTS]
         print(f"  拉到 {len(raw)} 条评论，过滤后剩 {len(filtered)} 条，取前 {len(top)} 条")
         sections.append((video, top))
+    return sections
 
-    path = write_markdown(keyword, sections)
+
+def _collect_from_videos(subject, videos):
+    """公共收尾：按 digg_count 排序取前 TOP_VIDEOS、拉评论、写 markdown。subject 作为标题/文件名。"""
+    videos = _apply_recent_filter(videos)
+    if not videos:
+        print("过滤后没有视频。可调大 RECENT_DAYS，或把 SEARCH_SORT_TYPE 改成 '0'(综合)/'2'(最新)。")
+        return
+    videos.sort(key=lambda v: v["digg_count"], reverse=True)
+    chosen = videos[:TOP_VIDEOS]
+    print(f"取点赞最高的 {len(chosen)} 条（最高赞 {human(chosen[0]['digg_count'])}）")
+    sections = _build_sections(chosen)
+    path = write_markdown(subject, sections)
     print(f"✅ 已写入 {path}")
+
+
+def cmd_collect(keyword):
+    print(f"正在搜索「{keyword}」…")
+    videos = search_videos(keyword)
+    if not videos:
+        print("没有搜到有效视频，退出。")
+        return
+    print(f"找到 {len(videos)} 条视频")
+    _collect_from_videos(keyword, videos)
+
+
+def cmd_user(target):
+    sec_user_id = extract_sec_user_id(target)
+    print(f"正在获取博主作品（sec_user_id={sec_user_id[:20]}…）")
+    videos = fetch_user_videos(sec_user_id)
+    if not videos:
+        print("没有拿到该博主的作品（检查主页链接/sec_user_id，或加 --debug 看返回）。")
+        return
+    author = videos[0].get("author") or ""
+    print(f"共 {len(videos)} 条作品" + (f"，博主：{author}" if author else ""))
+    subject = author or f"用户_{sec_user_id[:12]}"
+    _collect_from_videos(subject, videos)
 
 
 def main():
     parser = argparse.ArgumentParser(
         description="从 TikHub API 采集抖音热点视频的评论",
     )
-    parser.add_argument("keyword", nargs="?", help="要采集的关键词")
+    parser.add_argument("keyword", nargs="?", help="要采集的关键词（按话题模式）")
     parser.add_argument(
         "--hotlist", action="store_true", help="只调热榜接口，打印热词供肉眼挑选"
+    )
+    parser.add_argument(
+        "--user", metavar="链接或sec_uid", help="按博主采集：博主主页链接或 sec_user_id"
     )
     parser.add_argument(
         "--debug", action="store_true", help="打印每次请求的状态码和原始返回，便于排查"
@@ -409,7 +500,7 @@ def main():
     global DEBUG
     DEBUG = args.debug
 
-    if not args.hotlist and not args.keyword:
+    if not args.hotlist and not args.user and not args.keyword:
         parser.print_help()
         sys.exit(1)
 
@@ -419,6 +510,8 @@ def main():
 
     if args.hotlist:
         cmd_hotlist()
+    elif args.user:
+        cmd_user(args.user)
     else:
         cmd_collect(args.keyword)
 
